@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 
 // ── DATA ──────────────────────────────────────────────────────────────────────
 
@@ -53,6 +53,51 @@ const BADGES = [
   { id:"all_done",        icon:"🇫🇷", name:"Vive la France!", desc:"Complete all 5 scenarios" },
 ];
 
+const STORAGE_KEY = "french-tutor-progress-v1";
+const MAX_HISTORY = 30; // messages saved per scenario
+
+// ── TYPES ─────────────────────────────────────────────────────────────────────
+
+type Scenario = typeof SCENARIOS[number];
+interface Msg { id: number; who: "user"|"char"; text: string; en?: string; conf?: number; }
+interface Feedback {
+  score: number; xp: number; praise: string; correction: string|null; correctionNote: string|null;
+  pron?: { score: number; grade: string; tip: string; soundFocus: string };
+  grammarTip?: { rule: string; example: string; realLife: string };
+}
+interface RepeatResult { target: string; heard: string; score: number; conf: number; }
+interface SavedProgress {
+  xp: number;
+  done: string[];
+  badges: string[];
+  lastSessions: Record<string, Msg[]>;
+  savedAt: string;
+}
+
+// ── PERSISTENCE ───────────────────────────────────────────────────────────────
+
+function loadProgress(): SavedProgress | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as SavedProgress;
+  } catch { return null; }
+}
+
+function saveProgress(data: SavedProgress) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch {}
+}
+
+function exportProgress(data: SavedProgress) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href = url;
+  a.download = `french-tutor-backup-${new Date().toISOString().slice(0,10)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 // ── HELPERS ───────────────────────────────────────────────────────────────────
 
 const strSim = (a: string, b: string): number => {
@@ -67,6 +112,7 @@ const strSim = (a: string, b: string): number => {
 const getLevel = (xp: number) => [...LEVELS].reverse().find(l => xp >= l.min) || LEVELS[0];
 const xpPct    = (xp: number) => { const l = getLevel(xp); return Math.min(100, Math.round(((xp - l.min) / (l.max - l.min)) * 100)); };
 const pGrade   = (s: number): [string, string] => s >= 85 ? ["Excellent! 🌟","#16a34a"] : s >= 70 ? ["Bon! 👍","#2563eb"] : s >= 50 ? ["Pas mal 📈","#ca8a04"] : ["Réessayez 🔄","#dc2626"];
+const fmtDate  = (iso: string) => { try { return new Date(iso).toLocaleString(undefined, { dateStyle:"medium", timeStyle:"short" }); } catch { return iso; } };
 
 const ScoreRing = ({ score, size = 44 }: { score: number; size?: number }) => {
   const c = score >= 80 ? "#16a34a" : score >= 55 ? "#ca8a04" : "#ea580c";
@@ -82,73 +128,101 @@ const ScoreRing = ({ score, size = 44 }: { score: number; size?: number }) => {
   );
 };
 
-// ── TYPES ─────────────────────────────────────────────────────────────────────
-
-type Scenario = typeof SCENARIOS[number];
-interface Msg { id: number; who: "user"|"char"; text: string; en?: string; conf?: number; }
-interface Feedback {
-  score: number; xp: number; praise: string; correction: string|null; correctionNote: string|null;
-  pron?: { score: number; grade: string; tip: string; soundFocus: string };
-  grammarTip?: { rule: string; example: string; realLife: string };
-}
-
 // ── APP ───────────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [view,         setView]         = useState<"dashboard"|"scenario">("dashboard");
-  const [scenario,     setScenario]     = useState<Scenario|null>(null);
-  const [msgs,         setMsgs]         = useState<Msg[]>([]);
-  const [busy,         setBusy]         = useState(false);
-  const [listening,    setListening]    = useState(false);
-  const [repeatMode,   setRepeatMode]   = useState<number|null>(null);
-  const [repeatResult, setRepeatResult] = useState<{ target:string; heard:string; score:number; conf:number }|null>(null);
-  const [fb,           setFb]           = useState<Feedback|null>(null);
-  const [hint,         setHint]         = useState<string|null>(null);
-  const [speakId,      setSpeakId]      = useState<string|null>(null);
-  const [xp,           setXP]           = useState(0);
-  const [done,         setDone]         = useState<Set<string>>(new Set());
-  const [badges,       setBadges]       = useState<Set<string>>(new Set());
-  const [lvlUp,        setLvlUp]        = useState<typeof LEVELS[number]|null>(null);
-  const [msgN,         setMsgN]         = useState(0);
-  const [xpAnim,       setXpAnim]       = useState<string|null>(null);
-  const [micError,     setMicError]     = useState<string|null>(null);
-  const [useText,      setUseText]      = useState(false);
-  const [inputText,    setInputText]    = useState("");
+  // ── Load initial state from localStorage ──
+  const saved = loadProgress();
 
-  const voicesRef     = useRef<SpeechSynthesisVoice[]>([]);
+  const [view,             setView]             = useState<"dashboard"|"scenario">("dashboard");
+  const [scenario,         setScenario]         = useState<Scenario|null>(null);
+  const [msgs,             setMsgs]             = useState<Msg[]>([]);
+  const [busy,             setBusy]             = useState(false);
+  const [listening,        setListening]        = useState(false);
+  const [repeatMode,       setRepeatMode]       = useState<number|null>(null);
+  const [repeatResult,     setRepeatResult]     = useState<RepeatResult|null>(null);
+  const [corrRepeatMode,   setCorrRepeatMode]   = useState(false);
+  const [corrRepeatResult, setCorrRepeatResult] = useState<RepeatResult|null>(null);
+  const [fb,               setFb]               = useState<Feedback|null>(null);
+  const [hint,             setHint]             = useState<string|null>(null);
+  const [hintVisible,      setHintVisible]      = useState(false);
+  const [speakId,          setSpeakId]          = useState<string|null>(null);
+  const [xp,               setXP]               = useState(saved?.xp ?? 0);
+  const [done,             setDone]             = useState<Set<string>>(new Set(saved?.done ?? []));
+  const [badges,           setBadges]           = useState<Set<string>>(new Set(saved?.badges ?? []));
+  const [sessions,         setSessions]         = useState<Record<string, Msg[]>>(saved?.lastSessions ?? {});
+  const [lvlUp,            setLvlUp]            = useState<typeof LEVELS[number]|null>(null);
+  const [msgN,             setMsgN]             = useState(0);
+  const [xpAnim,           setXpAnim]           = useState<string|null>(null);
+  const [micError,         setMicError]         = useState<string|null>(null);
+  const [useText,          setUseText]          = useState(false);
+  const [inputText,        setInputText]        = useState("");
+  const [importError,      setImportError]      = useState<string|null>(null);
+  const [importSuccess,    setImportSuccess]    = useState(false);
+  const [showResumeModal,  setShowResumeModal]  = useState<Scenario|null>(null);
+
   const recRef        = useRef<SpeechRecognition|null>(null);
   const afterSpeakRef = useRef<(()=>void)|null>(null);
   const endRef        = useRef<HTMLDivElement>(null);
   const inputRef      = useRef<HTMLInputElement>(null);
+  const importRef     = useRef<HTMLInputElement>(null);
 
-  useEffect(() => { endRef.current?.scrollIntoView({ behavior:"smooth" }); }, [msgs, fb, hint, repeatResult, listening]);
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior:"smooth" }); },
+    [msgs, fb, hint, repeatResult, corrRepeatResult, listening]);
 
+  // ── Auto-save to localStorage whenever state changes ──
   useEffect(() => {
-    const load = () => { const v = window.speechSynthesis.getVoices(); if (v.length) voicesRef.current = v; };
-    load();
-    window.speechSynthesis.addEventListener("voiceschanged", load);
-    return () => { window.speechSynthesis.removeEventListener("voiceschanged", load); window.speechSynthesis.cancel(); };
-  }, []);
+    saveProgress({
+      xp,
+      done: [...done],
+      badges: [...badges],
+      lastSessions: sessions,
+      savedAt: new Date().toISOString(),
+    });
+  }, [xp, done, badges, sessions]);
+
+  // ── Save current conversation into sessions map ──
+  useEffect(() => {
+    if (!scenario || msgs.length === 0) return;
+    setSessions(prev => ({
+      ...prev,
+      [scenario.id]: msgs.slice(-MAX_HISTORY),
+    }));
+  }, [msgs, scenario]);
 
   // ── TTS ───────────────────────────────────────────────────────────────────
 
-  const speak = (text: string, id: string, rate = 0.8) => {
+  const speak = useCallback((text: string, id: string, rate = 0.82) => {
+    if (!("speechSynthesis" in window)) return;
     window.speechSynthesis.cancel();
     if (speakId === id) { setSpeakId(null); afterSpeakRef.current = null; return; }
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = "fr-FR"; u.rate = rate; u.pitch = 1.05;
-    const vs = voicesRef.current;
-    const fr = vs.find(v => v.lang === "fr-FR") || vs.find(v => v.lang === "fr-BE") || vs.find(v => v.lang.startsWith("fr"));
-    if (fr) u.voice = fr;
-    u.onstart = () => setSpeakId(id);
-    u.onend   = () => { setSpeakId(null); afterSpeakRef.current?.(); afterSpeakRef.current = null; };
-    u.onerror = () => { setSpeakId(null); afterSpeakRef.current = null; };
-    window.speechSynthesis.speak(u);
-  };
+
+    const doSpeak = (voices: SpeechSynthesisVoice[]) => {
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = "fr-FR"; u.rate = rate; u.pitch = 1.05;
+      const fr = voices.find(v => v.lang === "fr-FR")
+              || voices.find(v => v.lang === "fr-BE")
+              || voices.find(v => v.lang.startsWith("fr"));
+      if (fr) u.voice = fr;
+      u.onstart = () => setSpeakId(id);
+      u.onend   = () => { setSpeakId(null); afterSpeakRef.current?.(); afterSpeakRef.current = null; };
+      u.onerror = () => { setSpeakId(null); afterSpeakRef.current = null; };
+      const keepAlive = setInterval(() => {
+        if (!window.speechSynthesis.speaking) clearInterval(keepAlive);
+        else { window.speechSynthesis.pause(); window.speechSynthesis.resume(); }
+      }, 10000);
+      window.speechSynthesis.speak(u);
+    };
+
+    const voices = window.speechSynthesis.getVoices();
+    if (voices.length > 0) doSpeak(voices);
+    else window.speechSynthesis.addEventListener("voiceschanged",
+      () => doSpeak(window.speechSynthesis.getVoices()), { once: true });
+  }, [speakId]);
 
   // ── STT ───────────────────────────────────────────────────────────────────
 
-  const startListeningFn = (onResult: (t: string, c: number) => void): boolean => {
+  const startListeningFn = useCallback((onResult: (t: string, c: number) => void): boolean => {
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SR) { setMicError("Voice input needs Chrome or Safari — or tap ⌨️ to type."); return false; }
     try { recRef.current?.abort(); } catch(e) {}
@@ -156,7 +230,8 @@ export default function App() {
     rec.lang = "fr-FR"; rec.continuous = false; rec.interimResults = false; rec.maxAlternatives = 3;
     rec.onstart  = () => { setListening(true); setMicError(null); };
     rec.onresult = (e: SpeechRecognitionEvent) => {
-      const best = Array.from(e.results[0]).reduce((a: SpeechRecognitionAlternative, b: SpeechRecognitionAlternative) => a.confidence > b.confidence ? a : b);
+      const best = Array.from(e.results[0]).reduce((a: SpeechRecognitionAlternative, b: SpeechRecognitionAlternative) =>
+        a.confidence > b.confidence ? a : b);
       setListening(false);
       onResult(best.transcript, best.confidence);
     };
@@ -170,25 +245,22 @@ export default function App() {
     recRef.current = rec;
     try { rec.start(); return true; }
     catch(e) { setMicError("Couldn't start microphone."); return false; }
-  };
+  }, []);
 
   // ── REPEAT-AFTER-ME ───────────────────────────────────────────────────────
 
   const handleRepeat = (targetText: string, msgId: number) => {
-    if (listening || repeatMode) return;
-    setRepeatResult(null);
-    setRepeatMode(msgId);
+    if (listening || repeatMode || corrRepeatMode) return;
+    setRepeatResult(null); setRepeatMode(msgId);
     afterSpeakRef.current = () => {
       setTimeout(() => {
         startListeningFn((transcript, confidence) => {
-          const sim   = strSim(targetText, transcript);
-          const score = Math.round(sim * 0.6 + Math.min(confidence, 0.99) * 100 * 0.4);
+          const score = Math.round(strSim(targetText, transcript) * 0.6 + Math.min(confidence, 0.99) * 100 * 0.4);
           setRepeatResult({ target: targetText, heard: transcript, score, conf: Math.round(confidence * 100) });
           setRepeatMode(null);
           const gain = score >= 80 ? 15 : score >= 55 ? 8 : 4;
           setXP(prev => prev + gain);
-          setXpAnim(`+${gain} XP`);
-          setTimeout(() => setXpAnim(null), 1800);
+          setXpAnim(`+${gain} XP`); setTimeout(() => setXpAnim(null), 1800);
           if (score >= 80) setBadges(prev => new Set([...prev, "pronouncer"]));
         });
       }, 350);
@@ -196,16 +268,36 @@ export default function App() {
     speak(targetText, `rep_${msgId}`, 0.72);
   };
 
+  // ── HEAR & REPEAT CORRECTION ──────────────────────────────────────────────
+
+  const handleCorrectionRepeat = (correctedText: string) => {
+    if (listening || repeatMode || corrRepeatMode) return;
+    setCorrRepeatMode(true); setCorrRepeatResult(null);
+    afterSpeakRef.current = () => {
+      setTimeout(() => {
+        startListeningFn((transcript, confidence) => {
+          const score = Math.round(strSim(correctedText, transcript) * 0.6 + Math.min(confidence, 0.99) * 100 * 0.4);
+          setCorrRepeatResult({ target: correctedText, heard: transcript, score, conf: Math.round(confidence * 100) });
+          setCorrRepeatMode(false);
+          const gain = score >= 80 ? 12 : score >= 55 ? 6 : 3;
+          setXP(prev => prev + gain);
+          setXpAnim(`+${gain} XP`); setTimeout(() => setXpAnim(null), 1800);
+          if (score >= 80) setBadges(prev => new Set([...prev, "pronouncer"]));
+        });
+      }, 350);
+    };
+    speak(correctedText, "corr_repeat", 0.72);
+  };
+
   // ── SEND MESSAGE ──────────────────────────────────────────────────────────
 
   const sendMessage = async (text: string, confidence = 0.75) => {
     if (!text?.trim() || busy || !scenario) return;
     setMsgs(prev => [...prev, { id: Date.now(), who:"user", text: text.trim(), conf: Math.round(confidence * 100) }]);
-    setInputText(""); setBusy(true); setFb(null); setHint(null);
+    setInputText(""); setBusy(true); setFb(null);
+    setHint(null); setHintVisible(false); setCorrRepeatResult(null);
 
     const history = msgs.map(m => `${m.who === "char" ? scenario.character : "Student"}: ${m.text}`).join("\n");
-    const confPct = Math.round(confidence * 100);
-
     const prompt = `You are ${scenario.character}, ${scenario.role} in France. Help this English speaker (school-level French, A1-A2) practice real conversational French.
 
 Setting: ${scenario.setting}
@@ -214,7 +306,7 @@ Topics to weave in naturally: ${scenario.topics.join(", ")}
 Conversation so far:
 ${history}
 Student just said: "${text}"
-Speech recognition confidence: ${confPct}%
+Speech recognition confidence: ${Math.round(confidence * 100)}%
 
 Be warm, encouraging, realistic. Keep French at A1-A2 level. If they used English, gently note they should try French.
 
@@ -240,14 +332,12 @@ Return ONLY valid JSON — no markdown, no code fences, no text outside the JSON
     "example": "French: '[sentence]' → English: '[translation]'",
     "realLife": "exactly where in daily Paris life you would use this"
   },
-  "hint": "what they could naturally say next (in English, one sentence)"
+  "hint": "A short natural French sentence they could say next, with English in brackets e.g. 'Je voudrais un café. [I would like a coffee.]'"
 }`;
 
     try {
-      // ↓ Calls YOUR Next.js API route — key stays secret on the server
       const res  = await fetch("/api/chat", {
-        method:"POST",
-        headers:{ "Content-Type":"application/json" },
+        method:"POST", headers:{ "Content-Type":"application/json" },
         body: JSON.stringify({ model:"claude-sonnet-4-20250514", max_tokens:950, messages:[{ role:"user", content:prompt }] })
       });
       const raw  = await res.json();
@@ -262,12 +352,10 @@ Return ONLY valid JSON — no markdown, no code fences, no text outside the JSON
       const prevLv = getLevel(xp);
       const newXP  = xp + gain;
       setXP(newXP);
-      setXpAnim(`+${gain} XP`);
-      setTimeout(() => setXpAnim(null), 1800);
+      setXpAnim(`+${gain} XP`); setTimeout(() => setXpAnim(null), 1800);
       if (getLevel(newXP).n > prevLv.n) { setLvlUp(getLevel(newXP)); setTimeout(() => setLvlUp(null), 3500); }
 
-      const newN = msgN + 1;
-      setMsgN(newN);
+      const newN = msgN + 1; setMsgN(newN);
       if (newN >= 5 && !done.has(scenario.id)) {
         const nd = new Set([...done, scenario.id]);
         setDone(nd);
@@ -286,13 +374,63 @@ Return ONLY valid JSON — no markdown, no code fences, no text outside the JSON
     setBusy(false);
   };
 
-  const startScenario = (s: Scenario) => {
+  // ── SCENARIO START / RESUME ───────────────────────────────────────────────
+
+  const doStartScenario = (s: Scenario, resume: boolean) => {
     window.speechSynthesis.cancel();
     setScenario(s);
-    setMsgs([{ id:0, who:"char", text:s.starter, en:s.starterEn }]);
-    setFb(null); setHint("Tap 🎤 to speak in French. Start with 'Bonjour !' — it's OK to be slow!"); setMsgN(0);
-    setRepeatResult(null); setRepeatMode(null); setMicError(null); setInputText(""); setUseText(false);
+    const savedMsgs = sessions[s.id] ?? [];
+    setMsgs(resume && savedMsgs.length > 0
+      ? savedMsgs
+      : [{ id:0, who:"char", text:s.starter, en:s.starterEn }]);
+    setFb(null); setHint(null); setHintVisible(false); setMsgN(0);
+    setRepeatResult(null); setRepeatMode(null);
+    setCorrRepeatResult(null); setCorrRepeatMode(false);
+    setMicError(null); setInputText(""); setUseText(false);
+    setShowResumeModal(null);
     setView("scenario");
+  };
+
+  const handleScenarioTap = (s: Scenario) => {
+    const hasSaved = (sessions[s.id]?.length ?? 0) > 1;
+    if (hasSaved) setShowResumeModal(s);
+    else doStartScenario(s, false);
+  };
+
+  // ── EXPORT / IMPORT ───────────────────────────────────────────────────────
+
+  const handleExport = () => {
+    exportProgress({ xp, done:[...done], badges:[...badges], lastSessions:sessions, savedAt:new Date().toISOString() });
+  };
+
+  const handleImport = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setImportError(null); setImportSuccess(false);
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const data = JSON.parse(ev.target?.result as string) as SavedProgress;
+        if (typeof data.xp !== "number" || !Array.isArray(data.done) || !Array.isArray(data.badges))
+          throw new Error("Invalid file");
+        setXP(data.xp);
+        setDone(new Set(data.done));
+        setBadges(new Set(data.badges));
+        setSessions(data.lastSessions ?? {});
+        setImportSuccess(true);
+        setTimeout(() => setImportSuccess(false), 3000);
+      } catch {
+        setImportError("Couldn't read that file — make sure it's a French Tutor backup.");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  const handleResetProgress = () => {
+    if (!confirm("Reset ALL progress? This cannot be undone.")) return;
+    setXP(0); setDone(new Set()); setBadges(new Set()); setSessions({});
+    localStorage.removeItem(STORAGE_KEY);
   };
 
   // ── DASHBOARD ──────────────────────────────────────────────────────────────
@@ -301,8 +439,37 @@ Return ONLY valid JSON — no markdown, no code fences, no text outside the JSON
     const lvl  = getLevel(xp);
     const pct  = xpPct(xp);
     const next = LEVELS.find(l => l.n === lvl.n + 1);
+    const savedAt = saved?.savedAt;
+
     return (
       <div className="min-h-screen bg-gray-50 pb-10">
+
+        {/* Resume modal */}
+        {showResumeModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-40 px-4">
+            <div className="bg-white rounded-2xl p-5 shadow-xl max-w-xs w-full">
+              <div className="text-2xl text-center mb-1">{showResumeModal.emoji}</div>
+              <h2 className="text-base font-bold text-center text-gray-800 mb-1">{showResumeModal.title}</h2>
+              <p className="text-xs text-center text-gray-500 mb-4">You have a saved conversation for this scenario.</p>
+              <div className="space-y-2">
+                <button onClick={() => doStartScenario(showResumeModal, true)}
+                  className="w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold rounded-xl transition-colors">
+                  ▶ Continue where I left off
+                </button>
+                <button onClick={() => doStartScenario(showResumeModal, false)}
+                  className="w-full py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-medium rounded-xl transition-colors">
+                  🔄 Start fresh
+                </button>
+                <button onClick={() => setShowResumeModal(null)}
+                  className="w-full py-2 text-gray-400 text-xs hover:text-gray-500 transition-colors">
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Hero */}
         <div className="bg-gradient-to-br from-blue-700 to-blue-800 text-white px-4 pt-6 pb-5">
           <div className="max-w-md mx-auto">
             <div className="flex items-center justify-between mb-4">
@@ -327,8 +494,10 @@ Return ONLY valid JSON — no markdown, no code fences, no text outside the JSON
         </div>
 
         <div className="max-w-md mx-auto px-4">
+
+          {/* Stats */}
           <div className="grid grid-cols-3 gap-2 -mt-4 mb-5">
-            {[[xp,"Total XP","text-blue-600"],[`${done.size}/5`,"Scenarios","text-green-600"],[badges.size,"Badges","text-yellow-500"]].map(([v,l,c]) => (
+            {([[xp,"Total XP","text-blue-600"],[`${done.size}/5`,"Scenarios","text-green-600"],[badges.size,"Badges","text-yellow-500"]] as const).map(([v,l,c]) => (
               <div key={String(l)} className="bg-white rounded-xl p-3 text-center shadow-sm">
                 <div className={`text-xl font-bold ${c}`}>{v}</div>
                 <div className="text-xs text-gray-500">{l}</div>
@@ -336,22 +505,22 @@ Return ONLY valid JSON — no markdown, no code fences, no text outside the JSON
             ))}
           </div>
 
-          <div className="bg-gradient-to-r from-blue-600 to-blue-700 rounded-2xl p-4 mb-5 text-white">
-            <p className="font-bold text-sm mb-1">🎯 Your 3-Month Goal</p>
-            <p className="text-blue-100 text-xs leading-relaxed">Understand & respond naturally in everyday French — cafés, restaurants, directions, hotels & shopping.</p>
-            <div className="flex flex-wrap gap-1.5 mt-2.5">
-              {["🎤 Voice input","🔊 Native audio","📊 Pronunciation grading","🎤 Repeat-after-me","💡 Grammar tips","🏅 XP & Badges"].map(t => (
-                <span key={t} className="text-xs bg-white bg-opacity-20 px-2 py-0.5 rounded-full">{t}</span>
-              ))}
+          {/* Save status */}
+          {savedAt && (
+            <div className="flex items-center gap-1.5 mb-4 px-0.5">
+              <div className="w-2 h-2 rounded-full bg-green-400 flex-shrink-0"/>
+              <p className="text-xs text-gray-400">Progress auto-saved · last saved {fmtDate(savedAt)}</p>
             </div>
-          </div>
+          )}
 
+          {/* Scenarios */}
           <p className="text-xs font-bold text-gray-500 uppercase tracking-widest mb-2.5">Choose a scenario</p>
           <div className="space-y-2.5 mb-6">
             {SCENARIOS.map(s => {
-              const isDone = done.has(s.id);
+              const isDone    = done.has(s.id);
+              const hasSaved  = (sessions[s.id]?.length ?? 0) > 1;
               return (
-                <button key={s.id} onClick={() => startScenario(s)}
+                <button key={s.id} onClick={() => handleScenarioTap(s)}
                   className="w-full bg-white rounded-2xl p-3.5 text-left shadow-sm border border-gray-100 hover:shadow-md hover:border-blue-200 transition-all active:scale-99">
                   <div className="flex items-center gap-3">
                     <div className={`w-12 h-12 rounded-xl bg-gradient-to-br ${s.color} flex items-center justify-center text-2xl flex-shrink-0`}>{s.emoji}</div>
@@ -359,7 +528,8 @@ Return ONLY valid JSON — no markdown, no code fences, no text outside the JSON
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="font-bold text-gray-800 text-sm">{s.title}</span>
                         <span className="text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded font-medium">{s.difficulty}</span>
-                        {isDone && <span className="text-xs bg-green-100 text-green-700 px-1.5 py-0.5 rounded font-medium">✓ Done</span>}
+                        {isDone   && <span className="text-xs bg-green-100 text-green-700 px-1.5 py-0.5 rounded font-medium">✓ Done</span>}
+                        {hasSaved && !isDone && <span className="text-xs bg-blue-100 text-blue-600 px-1.5 py-0.5 rounded font-medium">↩ Resume</span>}
                       </div>
                       <p className="text-xs text-gray-500 mt-0.5">{s.subtitle} · with {s.character}</p>
                       <p className="text-xs text-gray-400 mt-0.5 truncate">{s.topics.slice(0,3).join(" · ")}</p>
@@ -374,8 +544,9 @@ Return ONLY valid JSON — no markdown, no code fences, no text outside the JSON
             })}
           </div>
 
+          {/* Badges */}
           <p className="text-xs font-bold text-gray-500 uppercase tracking-widest mb-2.5">Badges — {badges.size}/{BADGES.length} earned</p>
-          <div className="grid grid-cols-3 gap-2 mb-5">
+          <div className="grid grid-cols-3 gap-2 mb-6">
             {BADGES.map(b => {
               const earned = badges.has(b.id);
               return (
@@ -389,9 +560,37 @@ Return ONLY valid JSON — no markdown, no code fences, no text outside the JSON
             })}
           </div>
 
-          <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 text-xs text-blue-700 leading-relaxed">
-            <strong>🎤 Voice tips:</strong> Works best in Chrome. Speak clearly and a little slower than normal — French vowels take practice! Tap <strong>🎤 Repeat</strong> on any character bubble to practice that exact phrase.
+          {/* ── PROGRESS BACKUP SECTION ── */}
+          <p className="text-xs font-bold text-gray-500 uppercase tracking-widest mb-2.5">Progress Backup</p>
+          <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-4 mb-6 space-y-3">
+            <p className="text-xs text-gray-500 leading-relaxed">
+              Your progress is auto-saved in this browser. Use export/import to back it up or move it to a new device.
+            </p>
+
+            {/* Export */}
+            <button onClick={handleExport}
+              className="w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold rounded-xl transition-colors flex items-center justify-center gap-2">
+              ⬇️ Export progress as JSON file
+            </button>
+
+            {/* Import */}
+            <div>
+              <button onClick={() => importRef.current?.click()}
+                className="w-full py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-medium rounded-xl transition-colors flex items-center justify-center gap-2">
+                ⬆️ Import progress from backup
+              </button>
+              <input ref={importRef} type="file" accept=".json" className="hidden" onChange={handleImport}/>
+              {importError   && <p className="text-xs text-red-500 mt-1.5 text-center">{importError}</p>}
+              {importSuccess && <p className="text-xs text-green-600 mt-1.5 text-center font-medium">✓ Progress restored successfully!</p>}
+            </div>
+
+            {/* Reset */}
+            <button onClick={handleResetProgress}
+              className="w-full py-2 text-xs text-red-400 hover:text-red-600 transition-colors underline">
+              Reset all progress
+            </button>
           </div>
+
         </div>
       </div>
     );
@@ -406,6 +605,8 @@ Return ONLY valid JSON — no markdown, no code fences, no text outside the JSON
 
     return (
       <div className="flex flex-col h-screen bg-gray-50 overflow-hidden">
+
+        {/* Header */}
         <div className={`bg-gradient-to-r ${scenario.color} text-white px-3 py-3 flex-shrink-0`}>
           <div className="max-w-lg mx-auto flex items-center gap-2">
             <button onClick={() => { setView("dashboard"); window.speechSynthesis.cancel(); try { recRef.current?.abort(); } catch(e) {} }}
@@ -424,6 +625,7 @@ Return ONLY valid JSON — no markdown, no code fences, no text outside the JSON
           </div>
         </div>
 
+        {/* Character strip */}
         <div className={`${scenario.bg} border-b border-gray-200 px-3 py-2 flex-shrink-0`}>
           <div className="max-w-lg mx-auto flex items-center gap-2">
             <div className={`w-7 h-7 rounded-full bg-gradient-to-br ${scenario.color} flex items-center justify-center text-white font-bold text-xs flex-shrink-0`}>{scenario.character[0]}</div>
@@ -432,6 +634,7 @@ Return ONLY valid JSON — no markdown, no code fences, no text outside the JSON
           </div>
         </div>
 
+        {/* Messages */}
         <div className="flex-1 overflow-y-auto px-3 py-3">
           <div className="max-w-lg mx-auto space-y-3">
             {msgs.map(m => (
@@ -447,11 +650,11 @@ Return ONLY valid JSON — no markdown, no code fences, no text outside the JSON
                           {speakId === String(m.id) ? "⏸ Playing…" : "🔊 Listen"}
                         </button>
                         <button onClick={() => handleRepeat(m.text, m.id)}
-                          disabled={!!repeatMode || listening}
+                          disabled={!!repeatMode || listening || corrRepeatMode}
                           className={`text-xs px-2.5 py-1 rounded-full transition-all flex items-center gap-1 disabled:opacity-40 ${
                             repeatMode === m.id && listening ? "bg-red-100 text-red-600 font-medium animate-pulse"
-                            : repeatMode === m.id ? "bg-orange-100 text-orange-600 font-medium"
-                            : "bg-gray-100 text-gray-500 hover:bg-green-50 hover:text-green-600"}`}>
+                            : repeatMode === m.id          ? "bg-orange-100 text-orange-600 font-medium"
+                                                           : "bg-gray-100 text-gray-500 hover:bg-green-50 hover:text-green-600"}`}>
                           {repeatMode === m.id && listening ? "🎤 Speak now!" : repeatMode === m.id ? "🔊 Listen first…" : "🎤 Repeat"}
                         </button>
                       </div>
@@ -482,22 +685,20 @@ Return ONLY valid JSON — no markdown, no code fences, no text outside the JSON
                   <ScoreRing score={repeatResult.score}/>
                   <div>
                     {(() => { const [g,c] = pGrade(repeatResult.score); return <p className="font-bold text-sm" style={{color:c}}>{g}</p>; })()}
-                    <p className="text-xs text-gray-400">Recognition confidence: {repeatResult.conf}%</p>
+                    <p className="text-xs text-gray-400">Recognised at {repeatResult.conf}% confidence</p>
                   </div>
                 </div>
                 <div className="space-y-1.5 mb-2">
                   <div className="bg-gray-50 rounded-xl p-2.5">
-                    <p className="text-xs text-gray-400 mb-0.5">🎯 Target phrase</p>
+                    <p className="text-xs text-gray-400 mb-0.5">🎯 Target</p>
                     <p className="text-sm text-gray-800 font-medium italic">&ldquo;{repeatResult.target}&rdquo;</p>
                   </div>
                   <div className={`rounded-xl p-2.5 ${repeatResult.score >= 70 ? "bg-green-50" : "bg-orange-50"}`}>
-                    <p className="text-xs text-gray-400 mb-0.5">👂 What was heard</p>
+                    <p className="text-xs text-gray-400 mb-0.5">👂 Heard</p>
                     <p className={`text-sm font-medium italic ${repeatResult.score >= 70 ? "text-green-800" : "text-orange-800"}`}>&ldquo;{repeatResult.heard}&rdquo;</p>
                   </div>
                 </div>
-                {repeatResult.score < 80 && (
-                  <button onClick={() => setRepeatResult(null)} className="text-xs text-blue-600 hover:text-blue-700 font-medium underline">Try again →</button>
-                )}
+                {repeatResult.score < 80 && <button onClick={() => setRepeatResult(null)} className="text-xs text-blue-600 font-medium underline">Try again →</button>}
               </div>
             )}
 
@@ -538,7 +739,7 @@ Return ONLY valid JSON — no markdown, no code fences, no text outside the JSON
                           <span className="text-xs bg-purple-100 text-purple-600 px-1.5 py-0.5 rounded font-medium">{fb.pron.grade}</span>
                         </div>
                         <p className="text-xs text-purple-600 mt-0.5 leading-snug">{fb.pron.tip}</p>
-                        {fb.pron.soundFocus && <p className="text-xs text-purple-400 mt-0.5">🎯 Focus on: {fb.pron.soundFocus}</p>}
+                        {fb.pron.soundFocus && <p className="text-xs text-purple-400 mt-0.5">🎯 Focus: {fb.pron.soundFocus}</p>}
                       </div>
                     </div>
                   </div>
@@ -547,8 +748,31 @@ Return ONLY valid JSON — no markdown, no code fences, no text outside the JSON
                 {fb.correction && (
                   <div className="bg-orange-50 border border-orange-100 rounded-xl p-2.5">
                     <p className="text-xs font-semibold text-orange-600 mb-1">✏️ Better version</p>
-                    <p className="text-sm text-gray-800 font-medium italic">&ldquo;{fb.correction}&rdquo;</p>
-                    {fb.correctionNote && <p className="text-xs text-gray-500 mt-1">{fb.correctionNote}</p>}
+                    <p className="text-sm text-gray-800 font-medium italic mb-1">&ldquo;{fb.correction}&rdquo;</p>
+                    {fb.correctionNote && <p className="text-xs text-gray-500 mb-2.5">{fb.correctionNote}</p>}
+                    <button onClick={() => fb.correction && handleCorrectionRepeat(fb.correction)}
+                      disabled={corrRepeatMode || !!repeatMode || listening}
+                      className={`w-full py-2 rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition-all disabled:opacity-50 ${
+                        corrRepeatMode && listening ? "bg-red-100 text-red-600 animate-pulse"
+                        : corrRepeatMode            ? "bg-orange-100 text-orange-600"
+                                                    : "bg-orange-500 hover:bg-orange-600 text-white"}`}>
+                      {corrRepeatMode && listening ? "🎤 Speak now — say the corrected phrase!" : corrRepeatMode ? "🔊 Listen to the correction first…" : "🔊 Hear it, then repeat the correction"}
+                    </button>
+                    {corrRepeatResult && (
+                      <div className={`mt-2.5 rounded-xl p-2.5 ${corrRepeatResult.score >= 70 ? "bg-green-50 border border-green-100" : "bg-red-50 border border-red-100"}`}>
+                        <div className="flex items-center gap-2 mb-1.5">
+                          <ScoreRing score={corrRepeatResult.score} size={36}/>
+                          <div>
+                            {(() => { const [g,c] = pGrade(corrRepeatResult.score); return <p className="font-bold text-xs" style={{color:c}}>{g}</p>; })()}
+                            <p className="text-xs text-gray-400">on the corrected phrase</p>
+                          </div>
+                        </div>
+                        <p className="text-xs text-gray-500 italic">&ldquo;{corrRepeatResult.heard}&rdquo;</p>
+                        {corrRepeatResult.score < 75 && (
+                          <button onClick={() => setCorrRepeatResult(null)} className="mt-1.5 text-xs text-orange-600 font-medium underline">Try again →</button>
+                        )}
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -560,13 +784,6 @@ Return ONLY valid JSON — no markdown, no code fences, no text outside the JSON
                     <p className="text-xs text-gray-500 mt-1 leading-snug">🗼 {fb.grammarTip.realLife}</p>
                   </div>
                 )}
-              </div>
-            )}
-
-            {hint && !busy && (
-              <div className="bg-yellow-50 border border-yellow-100 rounded-xl p-2.5">
-                <p className="text-xs font-semibold text-yellow-700 mb-0.5">💭 What to say next</p>
-                <p className="text-xs text-gray-600 leading-snug">{hint}</p>
               </div>
             )}
 
@@ -585,13 +802,33 @@ Return ONLY valid JSON — no markdown, no code fences, no text outside the JSON
           </div>
         </div>
 
+        {/* Input bar */}
         <div className="bg-white border-t border-gray-200 px-3 py-3 flex-shrink-0">
           <div className="max-w-lg mx-auto">
             {micError && <div className="mb-2 bg-red-50 border border-red-100 rounded-lg px-3 py-1.5 text-xs text-red-600">{micError}</div>}
+
+            {hint && (
+              <div className="mb-2">
+                {hintVisible ? (
+                  <div className="bg-yellow-50 border border-yellow-200 rounded-xl px-3 py-2 flex items-start justify-between gap-2">
+                    <div>
+                      <p className="text-xs font-semibold text-yellow-700 mb-0.5">💡 Suggested phrase</p>
+                      <p className="text-xs text-gray-700 leading-snug">{hint}</p>
+                    </div>
+                    <button onClick={() => setHintVisible(false)} className="text-yellow-400 hover:text-yellow-600 text-sm flex-shrink-0 mt-0.5">✕</button>
+                  </div>
+                ) : (
+                  <button onClick={() => setHintVisible(true)}
+                    className="w-full py-1.5 rounded-xl border border-dashed border-yellow-300 text-yellow-600 text-xs font-semibold hover:bg-yellow-50 transition-colors flex items-center justify-center gap-1.5">
+                    💡 Need a hint?
+                  </button>
+                )}
+              </div>
+            )}
+
             {useText ? (
               <div className="flex gap-2 items-center">
-                <button onClick={() => setUseText(false)} title="Switch to voice"
-                  className="w-10 h-10 flex items-center justify-center bg-gray-100 hover:bg-gray-200 rounded-full text-base flex-shrink-0">🎤</button>
+                <button onClick={() => setUseText(false)} className="w-10 h-10 flex items-center justify-center bg-gray-100 hover:bg-gray-200 rounded-full text-base flex-shrink-0">🎤</button>
                 <input ref={inputRef} value={inputText} onChange={e => setInputText(e.target.value)}
                   onKeyDown={e => e.key === "Enter" && sendMessage(inputText, 0.7)}
                   placeholder="Tapez en français…" disabled={busy}
@@ -604,12 +841,11 @@ Return ONLY valid JSON — no markdown, no code fences, no text outside the JSON
                 <button onClick={() => {
                   if (listening) { recRef.current?.stop(); return; }
                   startListeningFn((t, c) => sendMessage(t, c));
-                }} disabled={busy || !!repeatMode}
+                }} disabled={busy || !!repeatMode || corrRepeatMode}
                   className={`w-16 h-16 rounded-full flex items-center justify-center text-3xl shadow-lg transition-all active:scale-95 ${
                     listening ? "bg-red-500 scale-110 shadow-red-200 animate-pulse"
                     : busy    ? "bg-gray-300 cursor-not-allowed"
-                              : "bg-blue-600 hover:bg-blue-700 hover:scale-105"
-                  } text-white`}>
+                              : "bg-blue-600 hover:bg-blue-700 hover:scale-105"} text-white`}>
                   {listening ? "⏹" : "🎤"}
                 </button>
                 <p className="text-xs text-gray-400 text-center">
